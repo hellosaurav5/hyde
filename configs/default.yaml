@@ -1,0 +1,10 @@
+encoder_model: intfloat/e5-base-v2
+hyde_model: google/flan-t5-base
+k: 10
+n_hypos: 3
+hypo_max_new_tokens: 120
+hypo_temperature: 0.2
+hypo_top_p: 0.95
+passage_tok_len: 250
+passage_stride: 50
+
