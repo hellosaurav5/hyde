@@ -66,6 +66,17 @@ def load_index_inline(path_faiss: Path, path_sklearn: Path) -> _Index:
 
 index = load_index_inline(root / "runs" / "index.faiss", root / "runs" / "index.sklearn")
 
+# Load corpus passages so we can display evidence snippets
+passages = list(jsonlines.open(str(root / "data" / "passages.jsonl")))
+
+def highlight_snippet(text: str, query: str, max_chars: int = 400) -> str:
+    # naive highlight of query tokens (length > 2)
+    terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
+    s = text
+    for t in terms:
+        s = re.sub(fr"(?i)\b{re.escape(t)}\b", r"**\g<0>**", s)
+    return (s[:max_chars] + "…") if len(s) > max_chars else s
+
 # -----------------------------
 # E5 encoder via plain HF (no SentenceTransformer)
 # -----------------------------
@@ -100,16 +111,16 @@ mdl_hyde = AutoModelForSeq2SeqLM.from_pretrained(HYDE_MODEL)  # <-- stays on CPU
 mdl_hyde.eval()
 
 PROMPT = (
-    "Write a concise, factual passage (3–5 sentences) that would directly answer the question. "
-    "Prefer key entities, dates, and definitions; avoid speculation.\n\n"
-    "Question: {q}\nHypothetical passage:"
+    "Write a short, factual paragraph (2–4 sentences) in Wikipedia style that could answer the question. "
+    "Use real entity names and concrete facts. Include the specific city if relevant. "
+    "Do NOT restate the question. Do NOT invent names or places.\n\n"
+    "Question: {q}\nPassage:"
 )
 
 @torch.inference_mode()
 def gen_hypo(question: str) -> str:
-    x = tok_hyde(PROMPT.format(q=question), return_tensors="pt")  # CPU tensors
-    y = mdl_hyde.generate(**x, max_new_tokens=HYPO_MAX_NEW, do_sample=True,
-                          temperature=HYPO_TEMP, top_p=HYPO_TOP_P)
+    x = tok_hyde(PROMPT.format(q=question), return_tensors="pt")
+    y = mdl_hyde.generate(**x, max_new_tokens=60, do_sample=False)  # deterministic
     return tok_hyde.decode(y[0], skip_special_tokens=True).strip()
 
 # -----------------------------
@@ -192,5 +203,9 @@ if st.button("Search"):
             I = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
 
     st.divider()
+    st.markdown("### Retrieved corpus passages")
     for rank, pid in enumerate(I, start=1):
-        st.markdown(f"**#{rank} — [P{pid}] {meta[pid]['title']}**")
+        title = passages[pid].get("title", f"P{pid}")
+        text  = passages[pid].get("text", "")
+        st.markdown(f"**#{rank} — [P{pid}] {title}**")
+        st.markdown(highlight_snippet(text, q))

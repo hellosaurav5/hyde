@@ -43,8 +43,7 @@ python -m venv .venv
 # cmd/Git Bash: .venv\Scripts\activate
 pip install -U pip
 pip install -r requirements.txt
-# Optional FAISS (CPU). If it fails, we automatically fall back to sklearn:
-pip install -r requirements-extra-faiss.txt
+
 ```
 
 **`requirements.txt`**
