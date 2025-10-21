@@ -1,3 +1,25 @@
+# venv / caches
 .venv/
 __pycache__/
 *.pyc
+.cache/
+*.log
+
+# Hugging Face / model caches
+huggingface/
+**/.cache/
+**/models/
+
+# Data & generated artifacts
+data/*.jsonl
+runs/
+*.npy
+*.npz
+*.faiss
+*.sklearn
+*.pt
+*.bin
+*.safetensors
+
+# Streamlit
+.streamlit/
