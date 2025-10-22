@@ -61,25 +61,71 @@ def highlight_snippet(text: str, query: str, max_chars: int = 400) -> str:
 # =========================
 # Index loader (faiss or sklearn)
 # =========================
+# =========================
+# Index loader (faiss or sklearn) + metric detection
+# =========================
 class _Index:
     def __init__(self, faiss_index=None, sklearn_nn=None):
-        self._faiss = faiss_index; self._sk = sklearn_nn
+        self._faiss = faiss_index
+        self._sk = sklearn_nn
+        if faiss_index is not None:
+            import faiss
+            self.backend = "faiss"
+            mt = getattr(faiss_index, "metric_type", faiss.METRIC_INNER_PRODUCT)
+            self.metric = "ip" if mt == faiss.METRIC_INNER_PRODUCT else "l2"
+        else:
+            self.backend = "sklearn-cosine"
+            self.metric = "cosine"
+
     def search(self, qvecs: np.ndarray, k: int = 10):
         if self._faiss is not None:
-            D, I = self._faiss.search(qvecs.astype("float32"), k); return I, D
-        D, I = self._sk.kneighbors(qvecs, n_neighbors=k, return_distance=True); return I, D
+            D, I = self._faiss.search(qvecs.astype("float32"), k)  # FAISS: (distances/sims, indices)
+            return I, D
+        # sklearn NearestNeighbors (cosine): returns distances (smaller = better)
+        D, I = self._sk.kneighbors(qvecs, n_neighbors=k, return_distance=True)
+        return I, D
 
 def load_index_inline(path_faiss: Path, path_sklearn: Path) -> _Index:
     if path_faiss.exists():
         import faiss
         return _Index(faiss_index=faiss.read_index(str(path_faiss)))
-    import joblib
-    if not path_sklearn.exists():
-        st.error("No index found. Run: python -m scripts.02_build_index")
-        st.stop()
-    return _Index(sklearn_nn=joblib.load(str(path_sklearn)))
+    else:
+        import joblib
+        if not path_sklearn.exists():
+            st.error("No index found. Run: python -m scripts.02_build_index")
+            st.stop()
+        return _Index(sklearn_nn=joblib.load(str(path_sklearn)))
 
+    
 index = load_index_inline(root / "runs" / "index.faiss", root / "runs" / "index.sklearn")
+
+# --- normalize scores to a positive, "higher is better" similarity ---
+def _sim_scores(D_row):
+    """
+    Returns a cosine-like similarity in [-1, 1] (often ~[0.5, 0.9] for good hits):
+      - FAISS (inner product): already similarity -> return as-is.
+      - FAISS (L2): FAISS returns *squared* L2 distances; for unit vectors,
+                    cos_sim = 1 - (L2^2)/2  -> use 1 - 0.5 * D.
+      - sklearn (cosine distance): distance = 1 - cos_sim -> use 1 - distance.
+    """
+    import numpy as np
+    D = np.asarray(D_row, dtype=np.float32)
+
+    if index.backend == "faiss":
+        # If the index metric is available, it will be set to "ip" or "l2" in our loader.
+        if getattr(index, "metric", "ip") == "ip":
+            S = D  # already inner-product similarity
+        else:  # "l2"
+            # Convert squared L2 distance to cosine-like similarity
+            S = 1.0 - 0.5 * D
+    else:
+        # sklearn NearestNeighbors(metric='cosine') -> distances; convert to similarity
+        S = 1.0 - D
+
+    # Clamp to [-1, 1] just for neat display
+    S = np.clip(S, -1.0, 1.0)
+    return S
+
 
 # =========================
 # Encoder (E5 via HF, CPU)
@@ -235,58 +281,79 @@ def tok_simple(s: str): return re.findall(r"\w+", s.lower())
 bm25 = BM25Okapi([tok_simple(t) for t in pass_texts])
 
 def bm25_search(question: str, k: int = 20):
-    scores = bm25.get_scores(tok_simple(question))
-    idx = np.argsort(-np.array(scores))[:k]
-    return idx.tolist()
+    scores_all = bm25.get_scores(tok_simple(question))  # raw BM25
+    idx = np.argsort(-np.array(scores_all))[:k]
+    return idx.tolist(), np.array(scores_all)[idx]
 
 def rrf_fuse_many(lists, k=10, K=60):
+    """
+    lists: list of rank lists (each is a list of pids)
+    returns: (ranked_ids, score_map) where score_map[pid] is the fused score
+    """
     scores = {}
     for lst in lists:
         for r, pid in enumerate(lst, 1):
-            scores[pid] = scores.get(pid, 0.0) + 1.0/(K + r)
-    return [pid for pid,_ in sorted(scores.items(), key=lambda x:x[1], reverse=True)][:k]
+            scores[pid] = scores.get(pid, 0.0) + 1.0 / (K + r)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
+    ids = [pid for pid, _ in ranked]
+    score_map = {pid: sc for pid, sc in ranked}
+    return ids, score_map
 
 # =========================
 # Search functions
 # =========================
 def search_baseline(question: str, k: int):
-    qv = e5_encode(["query: " + question]); I, D = index.search(qv.astype("float32"), k)
-    return I[0], D[0]
+    qv = e5_encode(["query: " + question])
+    I, D = index.search(qv.astype("float32"), k)
+    S = _sim_scores(D[0])
+    return I[0], S
 
 def search_hyde(question: str, k: int, n: int = 1, show_hypos: bool = True):
     hypos = get_hypos(question, n)
     if show_hypos:
         with st.expander("Hypothetical passages", expanded=False):
-            for i, h in enumerate(hypos, 1): st.code(f"[{i}] {h}")
+            for i, h in enumerate(hypos, 1):
+                st.code(f"[{i}] {h}")
     hv = e5_encode(["query: " + h for h in hypos]).mean(axis=0)
-    I, D = index.search(hv[None,:].astype("float32"), k)
-    return I[0], D[0]
+    I, D = index.search(hv[None, :].astype("float32"), k)
+    S = _sim_scores(D[0])
+    return I[0], S
 
+
+
+# =========================
+# Action
+# =========================
 # =========================
 # Action
 # =========================
 if st.button("Search"):
     with st.spinner("Retrieving..."):
         if mode == "Baseline":
-            I, D = search_baseline(q, k)
+            I, S = search_baseline(q, k)
+            score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
         elif mode == "HyDE (1 hypo)":
-            I, D = search_hyde(q, k, n=1, show_hypos=show_hypos_ui)
+            I, S = search_hyde(q, k, n=1, show_hypos=show_hypos_ui)
+            score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
         elif mode == "Multi-HyDE (2 hypos)":
-            I, D = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            I, S = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
         elif mode.startswith("Fusion"):
-            I_base, _ = search_baseline(q, k)
-            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
-            I = rrf_fuse_many([I_base, I_hyde], k=k)
-        else:
-            I_base, _ = search_baseline(q, k)
-            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
-            I_bm = bm25_search(q, k)
-            I = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
+            I_base, _S_base = search_baseline(q, k)
+            I_hyde, _S_hyde = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            I, score_for = rrf_fuse_many([I_base, I_hyde], k=k)
+        else:  # Hybrid
+            I_base, _S_base = search_baseline(q, k)
+            I_hyde, _S_hyde = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            I_bm, _S_bm = bm25_search(q, k)
+            I, score_for = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
 
     st.divider()
     st.markdown("### Retrieved corpus passages")
     for rank, pid in enumerate(I, start=1):
         title = passages[pid].get("title", f"P{pid}")
         text  = passages[pid].get("text", "")
-        st.markdown(f"**#{rank} — [P{pid}] {title}**")
+        score = score_for.get(pid, float("nan"))
+        st.markdown(f"**#{rank} — [P{pid}] {title}**  \n*score:* `{score:.4f}`")
         st.markdown(highlight_snippet(text, q))
+
