@@ -1,4 +1,4 @@
-# app/demo.py — HyDE demo (simple) with Gemini 2.0 Flash via google.genai + local fallback
+# app/demo.py — HyDE demo with Gemini 2.0 Flash (google.genai Client) + local fallback, Fusion/Hybrid
 from __future__ import annotations
 import os, re, json, hashlib
 from pathlib import Path
@@ -10,9 +10,7 @@ from rank_bm25 import BM25Okapi
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForSeq2SeqLM
 
-# =========================
-# Streamlit UI
-# =========================
+# ========== UI ==========
 st.set_page_config(page_title="HyDE (ACL'23) — Demo", layout="wide")
 st.title("HyDE (ACL'23) — Minimal Demo")
 
@@ -26,21 +24,10 @@ k = st.slider("Top-k", 5, 30, 10)
 q = st.text_input("Question", "Who wrote the Federalist Papers and what was the purpose?")
 show_hypos_ui = st.checkbox("Show hypothetical passages", value=True)
 
-# Sidebar: paste your Google API key (no env var needed)
-st.sidebar.header("Gemini Settings")
-if "GKEY" not in st.session_state:
-    st.session_state.GKEY = os.environ.get("GOOGLE_API_KEY", "")
-gkey_input = st.sidebar.text_input("GOOGLE_API_KEY", value=st.session_state.GKEY, type="password")
-if st.sidebar.button("Use This Key"):
-    st.session_state.GKEY = gkey_input.strip()
-
-# =========================
-# Paths / corpus
-# =========================
+# ========== Paths / corpus ==========
 root = Path(__file__).resolve().parents[1]
 meta_path = root / "runs" / "meta.json"
 passages_path = root / "data" / "passages.jsonl"
-
 if not meta_path.exists():
     st.error(f"Missing {meta_path}. Build index first: python -m scripts.02_build_index")
     st.stop()
@@ -58,9 +45,7 @@ def highlight_snippet(text: str, query: str, max_chars: int = 400) -> str:
         s = re.sub(fr"(?i)\b{re.escape(t)}\b", r"**\g<0>**", s)
     return (s[:max_chars] + "…") if len(s) > max_chars else s
 
-# =========================
-# Index loader (faiss or sklearn)
-# =========================
+# ========== Index loader ==========
 class _Index:
     def __init__(self, faiss_index=None, sklearn_nn=None):
         self._faiss = faiss_index; self._sk = sklearn_nn
@@ -81,9 +66,7 @@ def load_index_inline(path_faiss: Path, path_sklearn: Path) -> _Index:
 
 index = load_index_inline(root / "runs" / "index.faiss", root / "runs" / "index.sklearn")
 
-# =========================
-# Encoder (E5 via HF, CPU)
-# =========================
+# ========== E5 encoder (HF, CPU) ==========
 @st.cache_resource(show_spinner=False)
 def get_e5():
     tok = AutoTokenizer.from_pretrained("intfloat/e5-base-v2", use_fast=True)
@@ -99,9 +82,7 @@ def e5_encode(texts: list[str]) -> np.ndarray:
     emb = torch.nn.functional.normalize(emb, p=2, dim=1)
     return emb.cpu().numpy()
 
-# =========================
-# Local HyDE fallback (flan-t5-small)
-# =========================
+# ========== Local HyDE fallback ==========
 @st.cache_resource(show_spinner=False)
 def get_local_hyde():
     tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
@@ -121,78 +102,98 @@ PROMPT = (
     "Question: {q}\nPassage:"
 )
 
-# =========================
-# Gemini 2.0 Flash via google.genai (simple)
-# =========================
+# ========== Gemini 2.0 Flash (google.genai Client) ==========
+API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+
 client = None
 GEN_CFG = None
 try:
     from google import genai
     from google.genai import types
-    if st.session_state.GKEY:
-        client = genai.Client(api_key=st.session_state.GKEY)
+    if API_KEY:
+        client = genai.Client(api_key=API_KEY)
+
+        SYSTEM_INSTRUCTION = (
+            "You write short, factual, Wikipedia-style passages that answer questions concisely. "
+            "Avoid any sexual content, profanity, violence, or unsafe instructions. Neutral tone."
+        )
+
         GEN_CFG = types.GenerateContentConfig(
-            system_instruction=(
-                "You write short, factual, Wikipedia-style passages that answer questions concisely. "
-                "Avoid sexual content, profanity, violence, or unsafe instructions. Neutral tone."
-            ),
+            system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.0, top_p=0.9, max_output_tokens=120,
-            # safety settings kept minimal & default-friendly; adjust if needed
             safety_settings=[
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT,
+                                    threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                                    threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                                    threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                                    threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_VIOLENCE,
                                     threshold=types.HarmBlockThreshold.BLOCK_NONE),
             ],
         )
-except Exception as e:
+except Exception:
     client = None
     GEN_CFG = None
-    st.sidebar.warning(f"google.genai not available: {e}")
 
-# Toggle + status
+# Toggle + live status
 USE_GEMINI = st.checkbox("Use Gemini 2.0 Flash for HyDE generation", value=bool(client), key="use_gemini")
 api_ok = bool(client)
-engine = "Gemini 2.0 Flash" if (USE_GEMINI and api_ok) else "Local flan-T5-small"
+engine = "Gemini 2.0 Flash (google.genai)" if (USE_GEMINI and api_ok) else "Local flan-T5-small"
 st.caption(f"HyDE generator: **{engine}**  |  API key: {'OK' if api_ok else 'MISSING'}  |  model: {'gemini-2.0-flash' if api_ok else '(none)'}")
 
-# Quick test button (verifies key + connectivity)
-if api_ok and st.sidebar.button("Test Gemini now"):
+# One-click test to verify Gemini is active
+if api_ok and st.button("Test Gemini now"):
     try:
-        r = client.models.generate_content(model="gemini-2.0-flash", contents=["Say OK in one word."])
-        st.sidebar.success(f"Gemini: {(getattr(r,'text','') or '').strip() or '(no text)'}")
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=["Say OK in one word."],
+            config=GEN_CFG,
+        )
+        st.success(f"Gemini response: {(getattr(resp,'text','') or '').strip() or '(no text)'}")
     except Exception as e:
-        st.sidebar.error(f"Gemini test failed: {e}")
+        st.error(f"Gemini test failed: {e}")
 
 def _extract_gemini_text(resp) -> str:
     txt = (getattr(resp, "text", None) or "").strip()
     if txt:
         return txt
+    # fallback: assemble text from candidates.parts
     pieces = []
     for c in getattr(resp, "candidates", []) or []:
         content = getattr(c, "content", None)
         if content and getattr(content, "parts", None):
             for p in content.parts:
-                if getattr(p, "text", None):
-                    pieces.append(p.text)
+                pt = getattr(p, "text", None)
+                if pt:
+                    pieces.append(pt)
     return " ".join(pieces).strip()
 
 def gen_hypo_with_gemini(question: str) -> str:
-    if not (USE_GEMINI and client):
+    if not (USE_GEMINI and client and GEN_CFG):
         return ""
     prompt = PROMPT.format(q=question)
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[prompt],
-            config=GEN_CFG,
-        )
-        return _extract_gemini_text(resp)
-    except Exception as e:
-        st.info(f"Gemini error: {e}. Falling back to local.")
-        return ""
+    # retry up to 2 times
+    for attempt in range(2):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[prompt],
+                config=GEN_CFG,
+            )
+            txt = _extract_gemini_text(resp)
+            if txt:
+                return txt
+            if hasattr(resp, "prompt_feedback") and resp.prompt_feedback:
+                st.warning(f"Gemini blocked/empty: {resp.prompt_feedback}")
+        except Exception as e:
+            if attempt == 1:
+                st.warning(f"Gemini error: {e}; using local fallback.")
+    return ""
 
-# =========================
-# Engine-aware cache (clear on toggle)
-# =========================
+# ========== Engine-aware cache (clear on toggle) ==========
 if "hyde_cache" not in st.session_state:
     st.session_state["hyde_cache"] = {}
 if "prev_use_gemini" not in st.session_state:
@@ -203,14 +204,16 @@ elif st.session_state["prev_use_gemini"] != USE_GEMINI:
 
 def cache_key(question: str, n: int) -> str:
     h = hashlib.md5(question.strip().encode("utf-8")).hexdigest()[:10]
-    tag = "gem20" if (USE_GEMINI and api_ok) else "loc"
-    return f"{h}::n={n}::engine={tag}"
+    engine_tag = "gem20" if (USE_GEMINI and api_ok) else "loc"
+    return f"{h}::n={n}::engine={engine_tag}"
 
 def gen_hypo(question: str) -> str:
     if USE_GEMINI and api_ok:
-        t = gen_hypo_with_gemini(question)
-        if t:
-            return t
+        txt = gen_hypo_with_gemini(question)
+        if txt:
+            return txt
+        else:
+            st.info("Falling back to local flan-T5 for this query.")
     return _local_hypo(PROMPT.format(q=question))
 
 def get_hypos(question: str, n: int):
@@ -220,35 +223,30 @@ def get_hypos(question: str, n: int):
         hypos = []
         for _ in range(n):
             h = gen_hypo(question)
-            if h.strip():
+            if h and h.strip():
                 hypos.append(h.strip())
         if not hypos:
             hypos = [_local_hypo(PROMPT.format(q=question))]
         cache[key] = hypos
     return cache[key]
 
-# =========================
-# BM25 / Fusion helpers
-# =========================
+# ========== BM25 / Fusion ==========
 pass_texts = [rec["text"] for rec in passages]
 def tok_simple(s: str): return re.findall(r"\w+", s.lower())
 bm25 = BM25Okapi([tok_simple(t) for t in pass_texts])
 
 def bm25_search(question: str, k: int = 20):
-    scores = bm25.get_scores(tok_simple(question))
-    idx = np.argsort(-np.array(scores))[:k]
+    scores = bm25.get_scores(tok_simple(question)); idx = np.argsort(-np.array(scores))[:k]
     return idx.tolist()
 
 def rrf_fuse_many(lists, k=10, K=60):
     scores = {}
     for lst in lists:
         for r, pid in enumerate(lst, 1):
-            scores[pid] = scores.get(pid, 0.0) + 1.0/(K + r)
+            scores[pid] = scores.get(pid, 0.0) + 1.0/(K+r)
     return [pid for pid,_ in sorted(scores.items(), key=lambda x:x[1], reverse=True)][:k]
 
-# =========================
-# Search functions
-# =========================
+# ========== Search funcs ==========
 def search_baseline(question: str, k: int):
     qv = e5_encode(["query: " + question]); I, D = index.search(qv.astype("float32"), k)
     return I[0], D[0]
@@ -262,9 +260,7 @@ def search_hyde(question: str, k: int, n: int = 1, show_hypos: bool = True):
     I, D = index.search(hv[None,:].astype("float32"), k)
     return I[0], D[0]
 
-# =========================
-# Action
-# =========================
+# ========== Action ==========
 if st.button("Search"):
     with st.spinner("Retrieving..."):
         if mode == "Baseline":
