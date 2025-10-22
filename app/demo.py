@@ -10,6 +10,27 @@ from rank_bm25 import BM25Okapi
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForSeq2SeqLM
 
+import os, google.generativeai as genai
+from google.generativeai import GenerativeModel
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY",""))
+
+# UI toggle
+USE_GEMINI_HYDE = st.checkbox("Use Gemini for hypos", value=True)
+
+# Cache the model in the app
+@st.cache_resource(show_spinner=False)
+def get_gemini_model():
+    return GenerativeModel("gemini-2.5-flash")  # or "gemini-2.5-pro"
+
+_gemini = get_gemini_model()
+
+PROMPT = (
+    "Write a short, factual paragraph (2–4 sentences) in Wikipedia style that could answer the question. "
+    "Use real entity names and concrete facts. Include the specific city if relevant. "
+    "Do NOT restate the question. Do NOT invent facts.\n\n"
+    "Question: {q}\nPassage:"
+)
+
 # -----------------------------
 # Paths & basic setup
 # -----------------------------
@@ -110,17 +131,21 @@ tok_hyde = AutoTokenizer.from_pretrained(HYDE_MODEL)
 mdl_hyde = AutoModelForSeq2SeqLM.from_pretrained(HYDE_MODEL)  # <-- stays on CPU; no .to()
 mdl_hyde.eval()
 
-PROMPT = (
-    "Write a short, factual paragraph (2–4 sentences) in Wikipedia style that could answer the question. "
-    "Use real entity names and concrete facts. Include the specific city if relevant. "
-    "Do NOT restate the question. Do NOT invent names or places.\n\n"
-    "Question: {q}\nPassage:"
-)
 
-@torch.inference_mode()
 def gen_hypo(question: str) -> str:
+    if USE_GEMINI_HYDE:
+        try:
+            resp = _gemini.generate_content(
+                PROMPT.format(q=question),
+                generation_config={"max_output_tokens": 80, "temperature": 0.1, "top_p": 0.9},
+            )
+            return (resp.text or "").strip()
+        except Exception as e:
+            st.warning(f"Gemini call failed; falling back to local model. ({e})")
+
+    # FALLBACK: your existing local flan-t5-small path:
     x = tok_hyde(PROMPT.format(q=question), return_tensors="pt")
-    y = mdl_hyde.generate(**x, max_new_tokens=60, do_sample=False)  # deterministic
+    y = mdl_hyde.generate(**x, max_new_tokens=80, do_sample=False)
     return tok_hyde.decode(y[0], skip_special_tokens=True).strip()
 
 # -----------------------------
