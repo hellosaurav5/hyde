@@ -23,7 +23,7 @@ mode = st.radio(
     horizontal=True,
 )
 k = st.slider("Top-k", 5, 30, 10)
-q = st.text_input("Question", "Who wrote the Federalist Papers and what was the purpose?")
+q = st.text_input("Question", "Iqaluit Airport and Canadian North are based out of what country?")
 show_hypos_ui = st.checkbox("Show hypothetical passages", value=True)
 
 # Sidebar: paste your Google API key (no env var needed)
@@ -320,10 +320,16 @@ def search_hyde(question: str, k: int, n: int = 1, show_hypos: bool = True):
     return I[0], S
 
 
+def _normalize_score_map(score_map: dict[int, float]) -> dict[int, float]:
+    import numpy as np
+    if not score_map: return {}
+    vals = np.array(list(score_map.values()), dtype=np.float32)
+    vmin, vmax = float(vals.min()), float(vals.max())
+    if vmax - vmin < 1e-9:
+        return {pid: 1.0 for pid in score_map}  # all equal
+    return {pid: float((s - vmin) / (vmax - vmin)) for pid, s in score_map.items()}
 
-# =========================
-# Action
-# =========================
+
 # =========================
 # Action
 # =========================
@@ -332,21 +338,28 @@ if st.button("Search"):
         if mode == "Baseline":
             I, S = search_baseline(q, k)
             score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
+            score_label = "cosine-like sim"
         elif mode == "HyDE (1 hypo)":
             I, S = search_hyde(q, k, n=1, show_hypos=show_hypos_ui)
             score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
+            score_label = "cosine-like sim"
         elif mode == "Multi-HyDE (2 hypos)":
             I, S = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
             score_for = {pid: float(S[i]) for i, pid in enumerate(I)}
+            score_label = "cosine-like sim"
         elif mode.startswith("Fusion"):
-            I_base, _S_base = search_baseline(q, k)
-            I_hyde, _S_hyde = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
-            I, score_for = rrf_fuse_many([I_base, I_hyde], k=k)
+            I_base, _ = search_baseline(q, k)
+            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            I, rrf_scores = rrf_fuse_many([I_base, I_hyde], k=k)
+            score_for = _normalize_score_map(rrf_scores)
+            score_label = "RRF (normalized 0–1)"
         else:  # Hybrid
-            I_base, _S_base = search_baseline(q, k)
-            I_hyde, _S_hyde = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
-            I_bm, _S_bm = bm25_search(q, k)
-            I, score_for = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
+            I_base, _ = search_baseline(q, k)
+            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=show_hypos_ui)
+            I_bm, _ = bm25_search(q, k)
+            I, rrf_scores = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
+            score_for = _normalize_score_map(rrf_scores)
+            score_label = "RRF (normalized 0–1)"
 
     st.divider()
     st.markdown("### Retrieved corpus passages")
@@ -354,6 +367,6 @@ if st.button("Search"):
         title = passages[pid].get("title", f"P{pid}")
         text  = passages[pid].get("text", "")
         score = score_for.get(pid, float("nan"))
-        st.markdown(f"**#{rank} — [P{pid}] {title}**  \n*score:* `{score:.4f}`")
+        st.markdown(f"**#{rank} — [P{pid}] {title}**  \n*{score_label}:* `{score_for.get(pid, float('nan')):.4f}`")
         st.markdown(highlight_snippet(text, q))
 
