@@ -194,11 +194,11 @@ if st.button("Search"):
             I, D = search_hyde(q, k, n=2)
         elif mode.startswith("Fusion"):
             I_base, _ = search_baseline(q, k)
-            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=False)
+            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=True)
             I = rrf_fuse_many([I_base, I_hyde], k=k)
         else:  # Hybrid
             I_base, _ = search_baseline(q, k)
-            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=False)
+            I_hyde, _ = search_hyde(q, k, n=2, show_hypos=True)
             I_bm = bm25_search(q, k)
             I = rrf_fuse_many([I_base, I_hyde, I_bm], k=k)
 
